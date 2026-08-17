@@ -7,12 +7,12 @@
   --lime: #8dc63f;
   --lime-deep: #6fa32a;
   --lime-soft: #eef7df;
-  --paper: #f5f7f2;
+  --paper: #f8faf7;
   --ink: #1a2757;
   --muted: #5b6688;
-  --line: #d8e0d0;
+  --line: #e2e8dc;
   --white: #ffffff;
-  --background: var(--paper);
+  --background: #ffffff;
   --foreground: var(--ink);
 }
 
@@ -58,9 +58,9 @@ body {
 }
 
 .surface-grid {
+  background-color: #ffffff;
   background-image:
-    radial-gradient(ellipse 80% 50% at 50% -10%, color-mix(in srgb, var(--lime) 18%, transparent), transparent),
-    linear-gradient(to bottom, #ffffff, var(--paper));
+    radial-gradient(ellipse 80% 50% at 50% -10%, color-mix(in srgb, var(--lime) 10%, transparent), transparent);
 }
 
 .texture-dots {
