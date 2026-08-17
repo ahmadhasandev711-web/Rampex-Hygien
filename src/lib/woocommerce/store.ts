@@ -6,6 +6,12 @@ const WP_URL =
 
 const STORE_API = `${WP_URL}/wp-json/wc/store/v1`;
 
+const DEFAULT_HEADERS = {
+  "Accept": "application/json",
+  "User-Agent":
+    "Mozilla/5.0 (compatible; RampexHygieneStorefront/1.0; +https://rampexhygiene.com)",
+};
+
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -21,9 +27,17 @@ async function fetchWithRetry(
 ): Promise<Response> {
   let lastError: unknown;
 
+  const mergedInit: RequestInit = {
+    ...init,
+    headers: {
+      ...DEFAULT_HEADERS,
+      ...(init?.headers ?? {}),
+    },
+  };
+
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(url, init);
+      const res = await fetch(url, mergedInit);
       // If server error (502, 503, 504), retry
       if (res.status >= 500 && attempt < retries) {
         await sleep(backoffMs * Math.pow(2, attempt));
@@ -58,80 +72,111 @@ type FetchProductsOptions = {
 export async function fetchProducts(
   options: FetchProductsOptions = {},
 ): Promise<WooProduct[]> {
-  const {
-    perPage = 12,
-    page = 1,
-    orderby = "date",
-    order = "desc",
-    onSale,
-    search,
-    category,
-    include,
-  } = options;
+  try {
+    const {
+      perPage = 12,
+      page = 1,
+      orderby = "date",
+      order = "desc",
+      onSale,
+      search,
+      category,
+      include,
+    } = options;
 
-  const params = new URLSearchParams({
-    per_page: String(perPage),
-    page: String(page),
-    orderby,
-    order,
-  });
+    const params = new URLSearchParams({
+      per_page: String(perPage),
+      page: String(page),
+      orderby,
+      order,
+    });
 
-  if (onSale) params.set("on_sale", "true");
-  if (search) params.set("search", search);
-  if (category) params.set("category", category);
-  if (include && include.length > 0) {
-    params.set("include", include.join(","));
+    if (onSale) params.set("on_sale", "true");
+    if (search) params.set("search", search);
+    if (category) params.set("category", category);
+    if (include && include.length > 0) {
+      params.set("include", include.join(","));
+    }
+
+    const res = await fetchWithRetry(`${STORE_API}/products?${params}`, {
+      next: { revalidate: 60 },
+    });
+
+    if (!res.ok) {
+      return [];
+    }
+
+    return (await res.json()) as WooProduct[];
+  } catch (error) {
+    console.error("[fetchProducts]", error);
+    return [];
   }
-
-  const res = await fetchWithRetry(`${STORE_API}/products?${params}`, {
-    next: { revalidate: 60 },
-  });
-
-  if (!res.ok) {
-    throw new Error(`Failed to fetch products: ${res.status}`);
-  }
-
-  return res.json() as Promise<WooProduct[]>;
 }
 
 export async function fetchProductBySlug(
   slug: string,
 ): Promise<WooProduct | null> {
-  // Prefer the single-product path — clearer 404 vs error than ?slug= lists.
-  const res = await fetchWithRetry(
-    `${STORE_API}/products/${encodeURIComponent(slug)}`,
-    { next: { revalidate: 30 } },
-  );
+  try {
+    // 1. Try single product endpoint by slug
+    const directRes = await fetchWithRetry(
+      `${STORE_API}/products/${encodeURIComponent(slug)}`,
+      { next: { revalidate: 30 } },
+    );
 
-  if (res.status === 404) return null;
-  if (!res.ok) {
-    throw new Error(`Failed to fetch product "${slug}": ${res.status}`);
+    if (directRes.ok) {
+      const product = (await directRes.json()) as WooProduct;
+      if (
+        (product.type === "variation" || product.parent) &&
+        product.parent &&
+        product.parent > 0
+      ) {
+        const parent = await fetchProductById(product.parent);
+        if (parent) return parent;
+      }
+      return product;
+    }
+
+    // 2. Fallback to query by slug (?slug=...)
+    const queryRes = await fetchWithRetry(
+      `${STORE_API}/products?slug=${encodeURIComponent(slug)}`,
+      { next: { revalidate: 30 } },
+    );
+
+    if (queryRes.ok) {
+      const list = (await queryRes.json()) as WooProduct[];
+      if (Array.isArray(list) && list.length > 0 && list[0]) {
+        const product = list[0];
+        if (
+          (product.type === "variation" || product.parent) &&
+          product.parent &&
+          product.parent > 0
+        ) {
+          const parent = await fetchProductById(product.parent);
+          if (parent) return parent;
+        }
+        return product;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error("[fetchProductBySlug]", error);
+    return null;
   }
-
-  const product = (await res.json()) as WooProduct;
-
-  // Store API may resolve a variation that shares the parent slug —
-  // always load the variable parent so attributes/options are available.
-  if (
-    (product.type === "variation" || product.parent) &&
-    product.parent &&
-    product.parent > 0
-  ) {
-    const parent = await fetchProductById(product.parent);
-    if (parent) return parent;
-  }
-
-  return product;
 }
 
 export async function fetchProductById(
   id: number,
 ): Promise<WooProduct | null> {
-  const res = await fetchWithRetry(`${STORE_API}/products/${id}`, {
-    next: { revalidate: 30 },
-  });
-  if (!res.ok) return null;
-  return res.json() as Promise<WooProduct>;
+  try {
+    const res = await fetchWithRetry(`${STORE_API}/products/${id}`, {
+      next: { revalidate: 30 },
+    });
+    if (!res.ok) return null;
+    return (await res.json()) as WooProduct;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -148,7 +193,11 @@ async function mapConcurrent<T, R>(
   async function worker() {
     while (index < items.length) {
       const current = index++;
-      results[current] = await fn(items[current]);
+      try {
+        results[current] = await fn(items[current]);
+      } catch {
+        results[current] = null as R;
+      }
     }
   }
 
@@ -164,29 +213,36 @@ async function mapConcurrent<T, R>(
 export async function fetchProductVariations(
   product: WooProduct,
 ): Promise<WooProduct[]> {
-  const ids = product.variations?.map((v) => v.id) ?? [];
-  if (!ids.length) return [];
+  try {
+    const ids = product.variations?.map((v) => (typeof v === "object" ? v?.id : v)).filter(Boolean) as number[] ?? [];
+    if (!ids.length) return [];
 
-  // Limit parallel requests to max 4 concurrent requests to prevent WP PHP process exhaustion
-  const results = await mapConcurrent(ids, 4, (id) => fetchProductById(id));
-  return results.filter((v): v is WooProduct => v != null);
+    const results = await mapConcurrent(ids, 4, (id) => fetchProductById(id));
+    return results.filter((v): v is WooProduct => v != null);
+  } catch {
+    return [];
+  }
 }
 
 export async function fetchRelatedProducts(
   productId: number,
   perPage = 4,
 ): Promise<WooProduct[]> {
-  const params = new URLSearchParams({
-    related: String(productId),
-    per_page: String(perPage),
-  });
+  try {
+    const params = new URLSearchParams({
+      related: String(productId),
+      per_page: String(perPage),
+    });
 
-  const res = await fetchWithRetry(`${STORE_API}/products?${params}`, {
-    next: { revalidate: 60 },
-  });
+    const res = await fetchWithRetry(`${STORE_API}/products?${params}`, {
+      next: { revalidate: 60 },
+    });
 
-  if (!res.ok) return [];
-  return res.json() as Promise<WooProduct[]>;
+    if (!res.ok) return [];
+    return (await res.json()) as WooProduct[];
+  } catch {
+    return [];
+  }
 }
 
 export function getStoreApiBase() {
